@@ -9,53 +9,124 @@ import (
 )
 
 func main() {
-	http.HandleFunc("/get", get)
-	http.HandleFunc("/put", put)
+	go start()
+	http.HandleFunc("/listen", decor(listen))
+	http.HandleFunc("/put", decor(put))
 	err := http.ListenAndServe("127.0.0.1:8080", nil)
 	log.Fatal(err)
 }
 
-func get(w http.ResponseWriter, r *http.Request) {
-	defer un(trace("get"))
+func start() {
+	for {
+		select {
+		case r := <-recvch:
+			ch, ok := recvrs[r.key]
+			if !ok {
+				ch = make(chan string)
+				recvrs[r.key] = ch
+			}
+			r.ch <- ch
+		case m := <-msgch:
+			ch, ok := recvrs[m.key]
+			if !ok {
+				continue
+			}
+			ch <- m.text
+		}
+	}
+}
 
+func listen(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	ctx, cancel := context.WithTimeout(ctx, time.Minute)
-	defer cancel()
-
+	recv := receiver{
+		key: r.FormValue("key"),
+		ch:  make(chan chan string),
+	}
 	select {
-	case rm := <-messageCh:
-		fmt.Fprintln(w, rm.message.Text)
+	case recvch <- recv:
 	case <-ctx.Done():
-		err := ctx.Err()
-		log.Print(err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		ise(ctx.Err())
+	}
+	var ch chan string
+	select {
+	case ch = <-recv.ch:
+	case <-ctx.Done():
+		ise(ctx.Err())
+	}
+	select {
+	case m := <-ch:
+		fmt.Fprint(w, m)
+	case <-ctx.Done():
+		ise(ctx.Err())
 	}
 }
 
 func put(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	defer un(trace("put"))
-
-	sender := r.FormValue("sender")
-	recv := r.FormValue("receiver")
-	m := Message{
-		Text: r.FormValue("text"),
-		Time: time.Now(),
+	m := message{
+		key:  r.FormValue("key"),
+		text: r.FormValue("text"),
 	}
-
-	rm := rawMessage{
-		sender:   sender,
-		receiver: recv,
-		message:  m,
-		response: make(chan string),
-	}
-	messageCh <- rm
 	select {
-	case res := <-rm.response:
-		fmt.Fprintln(w, res)
+	case msgch <- m:
+		fmt.Fprint(w, "sent ok")
 	case <-ctx.Done():
-		err := ctx.Err()
-		log.Print(err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		ise(ctx.Err())
 	}
+}
+
+type receiver struct {
+	key string
+	ch  chan chan string
+}
+
+type message struct {
+	key  string
+	text string
+}
+
+var (
+	recvch = make(chan receiver)
+	recvrs = make(map[string]chan string)
+
+	msgch = make(chan message)
+)
+
+func decor(fn func(http.ResponseWriter, *http.Request)) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		ctx, cancel := context.WithTimeout(ctx, time.Minute)
+		defer cancel()
+
+		path := r.URL.Path
+		defer un(trace(path))
+		defer func() {
+			switch x := recover().(type) {
+			case nil:
+			case error:
+				http.Error(
+					w,
+					x.Error(),
+					http.StatusInternalServerError)
+			}
+		}()
+		fn(w, r)
+	}
+}
+
+func un(s string, start time.Time) {
+	t := time.Now()
+	elapsed := t.Sub(start)
+	log.Printf("leaving %s (took %v)", s, elapsed)
+}
+
+func trace(s string) (string, time.Time) {
+	start := time.Now()
+	log.Printf("entering %s", s)
+	return s, start
+}
+
+func ise(err error) {
+	log.Print(err)
+	panic(err)
 }
